@@ -1,22 +1,26 @@
-import os 
-import cv2 
-import glob
+import cv2
+import gc
+import sys
+import time
+from contextlib import nullcontext
 from pathlib import Path
 import utils
 import argparse
 import numpy as np
+from PIL import Image
 
 import torch
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-from utils import convert_state_dict
-from models import restormer_arch
-from data.preprocess.crop_merge_image import stride_integral
 
-os.sys.path.append('./data/MBD/')
-from data.MBD.infer import net1_net2_infer_single_im
 
 
 def dewarp_prompt(img):
+    # Load MBD only for dewarping, so other tasks do not load its networks.
+    mbd_dir = str(Path(__file__).resolve().parent / 'data' / 'MBD')
+    if mbd_dir not in sys.path:
+        sys.path.append(mbd_dir)
+    from data.MBD.infer import net1_net2_infer_single_im
+
     mask = net1_net2_infer_single_im(img,'models/mbd.pkl')
     base_coord = utils.getBasecoord(256,256)/256
     img[mask==0]=0
@@ -93,448 +97,485 @@ def binarization_promptv2(img):
     high_frequency = cv2.cvtColor(high_frequency,cv2.COLOR_BGR2GRAY)
     return np.concatenate((np.expand_dims(thresh,-1),np.expand_dims(high_frequency,-1),np.expand_dims(result,-1)),-1)
 
-def dewarping(model,im_path,memory_fix=0):
-    INPUT_SIZE=256
-    im_org = cv2.imread(im_path)
-    
-    # OOM Fix: Resize down input based on level only if image is larger than limit
-    h_orig, w_orig = im_org.shape[:2]
-    was_resized = False
-    
-    limit_map = {1: 1500, 2: 2000, 3: 3000}
-    max_dim = limit_map.get(memory_fix, 0)
 
-    # Only resize if max_dim is set AND image is larger than max_dim
-    if max_dim > 0 and max(h_orig, w_orig) > max_dim:
-        scale = float(max_dim) / max(h_orig, w_orig)
-        new_w, new_h = int(w_orig * scale), int(h_orig * scale)
-        im_org = cv2.resize(im_org, (new_w, new_h))
-        was_resized = True
+# Restormer uses three downsampling levels: sizes and tile origins must be
+# divisible by 8. Only one tile is on the GPU; blending happens in CPU RAM.
+FACTOR = 8
+MIN_TILE_SIZE = 128
+DEFAULT_TILE_SIZE = 512
+TASKS = ('dewarping', 'deshadowing', 'appearance', 'deblurring',
+         'binarization', 'end2end')
+IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp'}
 
-    im_masked, prompt_org = dewarp_prompt(im_org.copy())
 
-    h,w = im_masked.shape[:2]
-    im_masked = im_masked.copy()
-    im_masked = cv2.resize(im_masked,(INPUT_SIZE,INPUT_SIZE))
-    im_masked = im_masked / 255.0
-    im_masked = torch.from_numpy(im_masked.transpose(2,0,1)).unsqueeze(0)
-    im_masked = im_masked.float().to(DEVICE)
+def _read_image(source):
+    # Arrays let end2end pass images between stages without JPEG round trips.
+    image = source if isinstance(source, np.ndarray) else cv2.imread(str(source))
+    if image is None:
+        raise ValueError('Cannot read image: {}'.format(source))
+    if image.ndim != 3 or image.shape[2] != 3 or min(image.shape[:2]) == 0:
+        raise ValueError('Expected a non-empty BGR image with three channels.')
+    return image
 
-    prompt = torch.from_numpy(prompt_org.transpose(2,0,1)).unsqueeze(0)
-    prompt = prompt.float().to(DEVICE)
 
-    in_im = torch.cat((im_masked,prompt),dim=1)
+def _model_device(model):
+    parameter = next(model.parameters(), None)
+    return parameter.device if parameter is not None else DEVICE
 
-    # inference
-    base_coord = utils.getBasecoord(INPUT_SIZE,INPUT_SIZE)/INPUT_SIZE
-    model = model.float()
-    with torch.no_grad():
-        pred = model(in_im)
-        pred = pred[0][:2].permute(1,2,0).cpu().numpy()
-        pred = pred+base_coord
-    ## smooth
-    for i in range(15):
-        pred = cv2.blur(pred,(3,3),borderType=cv2.BORDER_REPLICATE) 
-    pred = cv2.resize(pred,(w,h))*(w,h)
-    pred = pred.astype(np.float32)
-    out_im = cv2.remap(im_org,pred[:,:,0],pred[:,:,1],cv2.INTER_LINEAR)
 
-    prompt_org = (prompt_org*255).astype(np.uint8)
-    prompt_org = cv2.resize(prompt_org,im_org.shape[:2][::-1])
+def _inference_context():
+    # inference_mode was introduced in PyTorch 1.9; support older forks too.
+    if hasattr(torch, 'inference_mode'):
+        return torch.inference_mode()
+    return torch.no_grad()
 
-    # OOM Fix: Resize back output to original
-    if was_resized:
-        out_im = cv2.resize(out_im, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
-        prompt_org = cv2.resize(prompt_org, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
 
-    return prompt_org[:,:,0],prompt_org[:,:,1],prompt_org[:,:,2],out_im
+def _amp_context(device, precision):
+    if device.type != 'cuda' or precision == 'fp32':
+        return nullcontext()
+    if hasattr(torch, 'autocast'):
+        return torch.autocast(device_type='cuda', dtype=torch.float16)
+    return torch.cuda.amp.autocast()
 
-def appearance(model, im_path, memory_fix=0):
 
-    MAX_SIZE = 1600
+def _tile_settings(memory_fix, tile_size, tile_overlap):
+    presets = {0: DEFAULT_TILE_SIZE, 1: 256, 2: 512, 3: 768}
+    if memory_fix not in presets:
+        raise ValueError('memory_fix must be 0, 1, 2 or 3.')
+    size = presets[memory_fix] if tile_size is None else tile_size
+    if size < MIN_TILE_SIZE or size % FACTOR:
+        raise ValueError('tile_size must be at least 128 and divisible by 8.')
+    if tile_overlap < 0 or tile_overlap % FACTOR or tile_overlap >= size:
+        raise ValueError('tile_overlap must be nonnegative, divisible by 8, '
+                         'and smaller than tile_size.')
+    return size
 
-    if memory_fix == 1:
-        MAX_SIZE = 1500
-    elif memory_fix == 2:
-        MAX_SIZE = 2000
-    elif memory_fix == 3:
-        MAX_SIZE = 3000
 
-    # -------------------------
-    # Load image
-    # -------------------------
-    im_org = cv2.imread(im_path)
-    orig_h, orig_w = im_org.shape[:2]
+def _pad_to_factor(array):
+    h, w = array.shape[:2]
+    return np.pad(array, ((0, (-h) % FACTOR), (0, (-w) % FACTOR), (0, 0)),
+                  mode='symmetric')
 
-    # Generate prompt
-    prompt = appearance_prompt(im_org)
-    in_im = np.concatenate((im_org, prompt), -1)
 
-    # -------------------------
-    # Resize if larger than MAX_SIZE
-    # -------------------------
-    resized = False
-    if max(orig_w, orig_h) > MAX_SIZE:
-        scale = float(MAX_SIZE) / max(orig_w, orig_h)
-        new_w = int(orig_w * scale)
-        new_h = int(orig_h * scale)
-        in_im = cv2.resize(in_im, (new_w, new_h))
-        resized = True
-    else:
-        new_h, new_w = orig_h, orig_w
+def _tile_starts(length, tile_size, overlap):
+    if length <= tile_size:
+        return [0]
+    starts = list(range(0, length - tile_size + 1, tile_size - overlap))
+    if starts[-1] != length - tile_size:
+        starts.append(length - tile_size)
+    return starts
 
-    # -------------------------
-    # CRITICAL FIX
-    # Pad to multiple of 8
-    # -------------------------
-    factor = 8
 
-    pad_h = (factor - new_h % factor) % factor
-    pad_w = (factor - new_w % factor) % factor
+def _blend_axis(length, overlap, first, last):
+    weights = np.ones(length, dtype=np.float32)
+    ramp_size = min(overlap, length // 2)
+    if ramp_size:
+        ramp = np.arange(1, ramp_size + 1, dtype=np.float32) / (ramp_size + 1)
+        if not first:
+            weights[:ramp_size] = ramp
+        if not last:
+            weights[-ramp_size:] = ramp[::-1]
+    return weights
 
-    if pad_h != 0 or pad_w != 0:
-        in_im = cv2.copyMakeBorder(
-            in_im,
-            0, pad_h,
-            0, pad_w,
-            cv2.BORDER_REFLECT
-        )
 
-    padded_h, padded_w = in_im.shape[:2]
-
-    # -------------------------
-    # Normalize + tensor
-    # -------------------------
-    in_im = in_im / 255.0
-    in_im = torch.from_numpy(in_im.transpose(2, 0, 1)).unsqueeze(0)
-    in_im = in_im.half().to(DEVICE)
-
-    model = model.half()
-    model.eval()
-
-    # -------------------------
-    # Inference
-    # -------------------------
-    with torch.no_grad():
-        pred = model(in_im)
-        pred = torch.clamp(pred, 0, 1)
-        pred = pred[0].permute(1, 2, 0).cpu().numpy()
-        pred = (pred * 255).astype(np.uint8)
-
-    # -------------------------
-    # Remove padding
-    # -------------------------
-    pred = pred[:new_h, :new_w]
-
-    # -------------------------
-    # Restore to original size
-    # -------------------------
-    if resized:
-        pred[pred == 0] = 1
-        shadow_map = cv2.resize(im_org, (new_w, new_h)).astype(float) / pred.astype(float)
-        shadow_map = cv2.resize(shadow_map, (orig_w, orig_h))
-        shadow_map[shadow_map == 0] = 0.00001
-        out_im = np.clip(im_org.astype(float) / shadow_map, 0, 255).astype(np.uint8)
-    else:
-        out_im = pred
-
-    return prompt[:, :, 0], prompt[:, :, 1], prompt[:, :, 2], out_im
-    MAX_SIZE=1600 # Default default
-    
-    if memory_fix == 1:
-        MAX_SIZE = 1500
-    elif memory_fix == 2:
-        MAX_SIZE = 2000
-    elif memory_fix == 3:
-        MAX_SIZE = 3000
-
-    # obtain im and prompt
-    im_org = cv2.imread(im_path)
-    h,w = im_org.shape[:2]
-    prompt = appearance_prompt(im_org)
-    in_im = np.concatenate((im_org,prompt),-1)
-
-    # constrain the max resolution 
-    # If image is smaller than MAX_SIZE, it uses stride_integral (no resize, just padding)
-    if max(w,h) < MAX_SIZE:
-        in_im,padding_h,padding_w = stride_integral(in_im,8)
-    else:
-        in_im = cv2.resize(in_im,(MAX_SIZE,MAX_SIZE))
-    
-    # normalize
-    in_im = in_im / 255.0
-    in_im = torch.from_numpy(in_im.transpose(2,0,1)).unsqueeze(0)
-
-    # inference
-    in_im = in_im.half().to(DEVICE)
-    model = model.half()
-    with torch.no_grad():
-        pred = model(in_im)
-        pred = torch.clamp(pred,0,1)
-        pred = pred[0].permute(1,2,0).cpu().numpy()
-        pred = (pred*255).astype(np.uint8)
-
-        if max(w,h) < MAX_SIZE:
-            out_im = pred[padding_h:,padding_w:]
+def _forward_patch(model, image, prompt, precision, binarize):
+    # Convert on the CPU FIRST. The original code copied a float64 full page
+    # to CUDA before converting it to half, creating a large memory spike.
+    patch = np.concatenate((image, prompt), axis=2).astype(np.float32)
+    patch *= np.float32(1.0 / 255.0)
+    tensor = torch.from_numpy(np.ascontiguousarray(patch.transpose(2, 0, 1)))
+    tensor = tensor.unsqueeze(0).to(_model_device(model))
+    with _inference_context():
+        with _amp_context(tensor.device, precision):
+            prediction = model(tensor)
+        channels = 2 if binarize else 3
+        if (prediction.ndim != 4 or prediction.shape[0] != 1
+                or prediction.shape[1] < channels
+                or tuple(prediction.shape[2:]) != image.shape[:2]):
+            raise RuntimeError('Unexpected Restormer output shape: {}'.format(
+                tuple(prediction.shape)))
+        if binarize:
+            # argmax(softmax(logits)) == argmax(logits). Blend the logit
+            # difference before thresholding, so overlapping tiles do not
+            # create gray bands in the binary output. Ties remain class 0.
+            scores = prediction[0, :2].float()
+            result = (scores[1] - scores[0]).unsqueeze(-1).cpu().numpy()
         else:
-            pred[pred==0] = 1
-            shadow_map = cv2.resize(im_org,(MAX_SIZE,MAX_SIZE)).astype(float)/pred.astype(float)
-            shadow_map = cv2.resize(shadow_map,(w,h))
-            shadow_map[shadow_map==0]=0.00001
-            out_im = np.clip(im_org.astype(float)/shadow_map,0,255).astype(np.uint8)
+            result = prediction[0, :3].float().clamp(0, 1)
+            result = result.permute(1, 2, 0).cpu().numpy()
+    if not np.isfinite(result).all():
+        raise RuntimeError('Model produced NaN/Inf. Try --precision fp32.')
+    return result
 
-    return prompt[:,:,0],prompt[:,:,1],prompt[:,:,2],out_im
-        
 
-def deshadowing(model,im_path,memory_fix=0):
-    MAX_SIZE=1600 # Default default
-    
-    if memory_fix == 1:
-        MAX_SIZE = 1500
-    elif memory_fix == 2:
-        MAX_SIZE = 2000
-    elif memory_fix == 3:
-        MAX_SIZE = 3000
+def _tiled_pass(model, image, prompt, size, overlap, precision, binarize):
+    h, w = image.shape[:2]
+    ys = _tile_starts(h, size, overlap)
+    xs = _tile_starts(w, size, overlap)
+    channels = 1 if binarize else 3
+    summed = np.zeros((h, w, channels), dtype=np.float32)
+    weights = np.zeros((h, w, 1), dtype=np.float32)
+    for y in ys:
+        y2 = min(y + size, h)
+        wy = _blend_axis(y2 - y, overlap, y == 0, y2 == h)
+        for x in xs:
+            x2 = min(x + size, w)
+            wx = _blend_axis(x2 - x, overlap, x == 0, x2 == w)
+            tile_weight = (wy[:, None] * wx[None, :])[:, :, None]
+            result = _forward_patch(model, image[y:y2, x:x2],
+                                    prompt[y:y2, x:x2], precision, binarize)
+            summed[y:y2, x:x2] += result * tile_weight
+            weights[y:y2, x:x2] += tile_weight
+            del result
+    if np.any(weights <= 0):
+        raise RuntimeError('Tile coverage error: some pixels were not processed.')
+    summed /= weights
+    return summed
 
-    # obtain im and prompt
-    im_org = cv2.imread(im_path)
-    h,w = im_org.shape[:2]
-    prompt = deshadow_prompt(im_org)
-    in_im = np.concatenate((im_org,prompt),-1)
 
-    # constrain the max resolution 
-    if max(w,h) < MAX_SIZE:
-        in_im,padding_h,padding_w = stride_integral(in_im,8)
+def _is_cuda_oom(error):
+    oom_class = getattr(torch.cuda, 'OutOfMemoryError', None)
+    if oom_class is not None and isinstance(error, oom_class):
+        return True
+    message = str(error).lower()
+    return ('cuda out of memory' in message
+            or 'cuda error: out of memory' in message)
+
+
+def _predict_tiled(model, image, prompt, memory_fix=0, tile_size=None,
+                   tile_overlap=64, precision='auto', binarize=False):
+    size = _tile_settings(memory_fix, tile_size, tile_overlap)
+    if precision not in ('auto', 'fp32'):
+        raise ValueError('precision must be auto or fp32.')
+    if prompt.shape != image.shape:
+        raise ValueError('Prompt shape must match the input image.')
+    size = min(size, getattr(model, '_docres_safe_tile_size', size))
+    original_h, original_w = image.shape[:2]
+    image = _pad_to_factor(image)
+    prompt = _pad_to_factor(prompt)
+    model.float().eval()
+    device = _model_device(model)
+    while True:
+        # Reduce overlap as tiles shrink, retaining aligned tile origins.
+        overlap = min(tile_overlap, (size // 4) // FACTOR * FACTOR)
+        try:
+            prediction = _tiled_pass(model, image, prompt, size, overlap,
+                                     precision, binarize)
+            return prediction[:original_h, :original_w]
+        except RuntimeError as error:
+            if device.type != 'cuda' or not _is_cuda_oom(error):
+                raise
+        # Recovery must happen AFTER leaving except. An exception traceback
+        # retains the failed forward's tensors until its references are freed.
+        gc.collect()
+        torch.cuda.empty_cache()
+        if size <= MIN_TILE_SIZE:
+            raise RuntimeError('CUDA out of memory even with 128px tiles. '
+                               'Free GPU memory or run with --device cpu.')
+        size = max(MIN_TILE_SIZE, (size // 2) // FACTOR * FACTOR)
+        model._docres_safe_tile_size = size
+        print('CUDA OOM: retrying with {}x{} tiles.'.format(size, size), flush=True)
+
+
+def dewarping(model, im_path, memory_fix=0, **options):
+    # Dewarping predicts a GLOBAL coordinate map from a fixed 256px image.
+    # Tiling that map would break page geometry. Remap the original image.
+    input_size = 256
+    image = _read_image(im_path)
+    h, w = image.shape[:2]
+    masked, prompt = dewarp_prompt(image.copy())
+    masked = cv2.resize(masked, (input_size, input_size)).astype(np.float32)
+    masked *= np.float32(1.0 / 255.0)
+    model.float().eval()
+    device = _model_device(model)
+    image_tensor = torch.from_numpy(masked.transpose(2, 0, 1)).unsqueeze(0)
+    prompt_tensor = torch.from_numpy(
+        prompt.astype(np.float32).transpose(2, 0, 1)).unsqueeze(0)
+    tensor = torch.cat((image_tensor, prompt_tensor), dim=1).to(device)
+    with _inference_context():
+        prediction = model(tensor)[0, :2].permute(1, 2, 0).float().cpu().numpy()
+    prediction = prediction + utils.getBasecoord(input_size, input_size) / input_size
+    for _ in range(15):
+        prediction = cv2.blur(prediction, (3, 3), borderType=cv2.BORDER_REPLICATE)
+    prediction = (cv2.resize(prediction, (w, h)) * (w, h)).astype(np.float32)
+    output = cv2.remap(image, prediction[:, :, 0], prediction[:, :, 1],
+                       cv2.INTER_LINEAR)
+    prompt = cv2.resize((prompt * 255).astype(np.uint8), (w, h))
+    return prompt[:, :, 0], prompt[:, :, 1], prompt[:, :, 2], output
+
+
+def _restore_detail(model, im_path, prompt_function, memory_fix=0,
+                    binarize=False, **options):
+    image = _read_image(im_path)
+    prompt = prompt_function(image)
+    prediction = _predict_tiled(model, image, prompt, memory_fix=memory_fix,
+                                binarize=binarize, **options)
+    if binarize:
+        output = (prediction[:, :, 0] > 0).astype(np.uint8) * 255
     else:
-        in_im = cv2.resize(in_im,(MAX_SIZE,MAX_SIZE))
-    
-    # normalize
-    in_im = in_im / 255.0
-    in_im = torch.from_numpy(in_im.transpose(2,0,1)).unsqueeze(0)
-
-    # inference
-    in_im = in_im.half().to(DEVICE)
-    model = model.half()
-    with torch.no_grad():
-        pred = model(in_im)
-        pred = torch.clamp(pred,0,1)
-        pred = pred[0].permute(1,2,0).cpu().numpy()
-        pred = (pred*255).astype(np.uint8)
-
-        if max(w,h) < MAX_SIZE:
-            out_im = pred[padding_h:,padding_w:]
-        else:
-            pred[pred==0]=1
-            shadow_map = cv2.resize(im_org,(MAX_SIZE,MAX_SIZE)).astype(float)/pred.astype(float)
-            shadow_map = cv2.resize(shadow_map,(w,h))
-            shadow_map[shadow_map==0]=0.00001
-            out_im = np.clip(im_org.astype(float)/shadow_map,0,255).astype(np.uint8)
-
-    return prompt[:,:,0],prompt[:,:,1],prompt[:,:,2],out_im
+        output = (np.clip(prediction, 0, 1) * 255).astype(np.uint8)
+    return prompt[:, :, 0], prompt[:, :, 1], prompt[:, :, 2], output
 
 
-def deblurring(model,im_path,memory_fix=0):
-    # setup image
-    im_org = cv2.imread(im_path)
-    
-    # OOM Fix: Resize down input
-    h_orig, w_orig = im_org.shape[:2]
-    was_resized = False
-    
-    limit_map = {1: 1500, 2: 2000, 3: 3000}
-    max_dim = limit_map.get(memory_fix, 0)
-
-    if max_dim > 0 and max(h_orig, w_orig) > max_dim:
-        scale = float(max_dim) / max(h_orig, w_orig)
-        new_w, new_h = int(w_orig * scale), int(h_orig * scale)
-        im_org = cv2.resize(im_org, (new_w, new_h))
-        was_resized = True
-
-    in_im,padding_h,padding_w = stride_integral(im_org,8)
-    prompt = deblur_prompt(in_im)
-    in_im = np.concatenate((in_im,prompt),-1)
-    in_im = in_im / 255.0
-    in_im = torch.from_numpy(in_im.transpose(2,0,1)).unsqueeze(0)
-    in_im = in_im.half().to(DEVICE)  
-    # inference
-    model.to(DEVICE)
-    model.eval()
-    model = model.half()
-    with torch.no_grad():
-        pred = model(in_im)
-        pred = torch.clamp(pred,0,1)
-        pred = pred[0].permute(1,2,0).cpu().numpy()
-        pred = (pred*255).astype(np.uint8)
-        out_im = pred[padding_h:,padding_w:]
-    
-    # OOM Fix: Resize back output to original
-    if was_resized:
-        out_im = cv2.resize(out_im, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
-        prompt = cv2.resize(prompt, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
-    
-    return prompt[:,:,0],prompt[:,:,1],prompt[:,:,2],out_im
+def _restore_lighting(model, im_path, prompt_function, memory_fix=0, **options):
+    # Preserve the fork's global lighting-map method. Only its model forward
+    # is tiled. Text/detail correction is applied to the original-size image.
+    max_size = {0: 1600, 1: 1500, 2: 2000, 3: 3000}[memory_fix]
+    image = _read_image(im_path)
+    h, w = image.shape[:2]
+    prompt = prompt_function(image)
+    if max(h, w) > max_size:
+        scale = float(max_size) / max(h, w)
+        new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+        resized_image = cv2.resize(image, (new_w, new_h))
+        resized_prompt = cv2.resize(prompt, (new_w, new_h))
+        prediction = _predict_tiled(model, resized_image, resized_prompt,
+                                    memory_fix=memory_fix, **options)
+        prediction = np.maximum((prediction * 255).astype(np.uint8), 1)
+        shadow_map = resized_image.astype(np.float32) / prediction.astype(np.float32)
+        shadow_map = cv2.resize(shadow_map, (w, h))
+        np.maximum(shadow_map, np.float32(0.00001), out=shadow_map)
+        output = np.clip(image.astype(np.float32) / shadow_map, 0, 255).astype(np.uint8)
+    else:
+        prediction = _predict_tiled(model, image, prompt, memory_fix=memory_fix,
+                                    **options)
+        output = (prediction * 255).astype(np.uint8)
+    return prompt[:, :, 0], prompt[:, :, 1], prompt[:, :, 2], output
 
 
+def appearance(model, im_path, memory_fix=0, **options):
+    return _restore_lighting(model, im_path, appearance_prompt, memory_fix, **options)
 
-def binarization(model,im_path,memory_fix=0):
-    im_org = cv2.imread(im_path)
 
-    # OOM Fix: Resize down input
-    h_orig, w_orig = im_org.shape[:2]
-    was_resized = False
-    
-    limit_map = {1: 1500, 2: 2000, 3: 3000}
-    max_dim = limit_map.get(memory_fix, 0)
+def deshadowing(model, im_path, memory_fix=0, **options):
+    return _restore_lighting(model, im_path, deshadow_prompt, memory_fix, **options)
 
-    if max_dim > 0 and max(h_orig, w_orig) > max_dim:
-        scale = float(max_dim) / max(h_orig, w_orig)
-        new_w, new_h = int(w_orig * scale), int(h_orig * scale)
-        im_org = cv2.resize(im_org, (new_w, new_h))
-        was_resized = True
 
-    im,padding_h,padding_w = stride_integral(im_org,8)
-    prompt = binarization_promptv2(im)
-    h,w = im.shape[:2]
-    in_im = np.concatenate((im,prompt),-1)
+def deblurring(model, im_path, memory_fix=0, **options):
+    return _restore_detail(model, im_path, deblur_prompt, memory_fix, **options)
 
-    in_im = in_im / 255.0
-    in_im = torch.from_numpy(in_im.transpose(2,0,1)).unsqueeze(0)
-    in_im = in_im.to(DEVICE)
-    model = model.half()
-    in_im = in_im.half()
-    with torch.no_grad():
-        pred = model(in_im)
-        pred = pred[:,:2,:,:]
-        pred = torch.max(torch.softmax(pred,1),1)[1]
-        pred = pred[0].cpu().numpy()
-        pred = (pred*255).astype(np.uint8)
-        pred = cv2.resize(pred,(w,h))
-        out_im = pred[padding_h:,padding_w:]
-    
-    # OOM Fix: Resize back output to original
-    if was_resized:
-        out_im = cv2.resize(out_im, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
-        prompt = cv2.resize(prompt, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
-    
-    return prompt[:,:,0],prompt[:,:,1],prompt[:,:,2],out_im
 
-def get_args():
-    parser = argparse.ArgumentParser(description='Params')
-    parser.add_argument('--model_path', nargs='?', type=str, default='models/docres.pkl',help='Path of the saved checkpoint')
-    parser.add_argument('--im_path', nargs='?', type=str, default='./distorted/',
-                        help='Path of input document image')
-    parser.add_argument('--out_folder', nargs='?', type=str, default='./output/',
-                        help='Folder of the output images')
-    parser.add_argument('--task', nargs='?', type=str, default='dewarping', 
-                        help='task that need to be executed')
-    parser.add_argument('--save_dtsprompt', nargs='?', type=int, default=0, 
-                        help='Width of the input image')
-    parser.add_argument('--memory_fix', nargs='?', type=int, default=0, 
-                        help='1=1500px, 2=2000px, 3=3000px limit on long edge to avoid OOM.')
-    args = parser.parse_args()
-    possible_tasks = ['dewarping','deshadowing','appearance','deblurring','binarization','end2end']
-    assert args.task in possible_tasks, 'Unsupported task, task must be one of '+', '.join(possible_tasks)
+def binarization(model, im_path, memory_fix=0, **options):
+    return _restore_detail(model, im_path, binarization_promptv2, memory_fix,
+                           binarize=True, **options)
+
+
+def get_args(argv=None):
+    parser = argparse.ArgumentParser(description='DocRes inference with bounded GPU memory.')
+    parser.add_argument('--model_path', nargs='?', default='models/docres.pkl',
+                        help='Path of the saved checkpoint.')
+    parser.add_argument('--im_path', nargs='?', default='./distorted/',
+                        help='Input image or directory.')
+    parser.add_argument('--out_folder', nargs='?', default='./output/',
+                        help='Output directory.')
+    parser.add_argument('--task', nargs='?', choices=TASKS, default='dewarping')
+    parser.add_argument('--save_dtsprompt', nargs='?', type=int, default=0,
+                        help='Save prompt images when nonzero.')
+    parser.add_argument('--memory_fix', nargs='?', type=int, choices=(0, 1, 2, 3),
+                        default=0, help='Tile presets: 0=512, 1=256, 2=512, 3=768px. '
+                        'Lighting tasks keep their previous resize limits.')
+    parser.add_argument('--tile_size', type=int, default=None,
+                        help='Maximum tile edge, divisible by 8, minimum 128. '
+                        'Overrides memory_fix; default 512.')
+    parser.add_argument('--tile_overlap', type=int, default=64,
+                        help='Tile overlap, divisible by 8; default 64. '
+                        'Limited to one quarter of the current tile size.')
+    parser.add_argument('--precision', choices=('auto', 'fp32'), default='auto',
+                        help='auto=CUDA mixed precision / CPU float32; '
+                        'fp32=full precision.')
+    parser.add_argument('--device', choices=('auto', 'cuda', 'cpu'), default='auto',
+                        help='Restormer device; default auto. '
+                        'The separate MBD dewarping helper controls its own device.')
+    parser.add_argument('--output_format', choices=('png', 'tiff', 'jpg'), default='png',
+                        help='Output format; default lossless PNG. '
+                        'Binarization supports PNG and TIFF.')
+    parser.add_argument('--binary_bits', type=int, choices=(1, 8), default=1,
+                        help='Binarization storage: 1=packed black/white (default), '
+                        '8=grayscale containing only black/white pixels. '
+                        'Does not affect other tasks.')
+    parser.add_argument('--jpeg_quality', type=int, default=95,
+                        help='JPEG quality from 1 to 100; default 95.')
+    args = parser.parse_args(argv)
+    try:
+        _tile_settings(args.memory_fix, args.tile_size, args.tile_overlap)
+    except (TypeError, ValueError) as error:
+        parser.error(str(error))
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        parser.error('CUDA is unavailable. Use --device cpu or --device auto.')
+    if args.task == 'binarization' and args.output_format == 'jpg':
+        parser.error('Binarization requires lossless PNG or TIFF; JPEG alters binary pixels.')
+    if not 1 <= args.jpeg_quality <= 100:
+        parser.error('jpeg_quality must be between 1 and 100.')
     return args
 
+
 def model_init(args):
-   # prepare model
-    model = restormer_arch.Restormer( 
-        inp_channels=6, 
-        out_channels=3, 
-        dim = 48,
-        num_blocks = [2,3,3,4], 
-        num_refinement_blocks = 4,
-        heads = [1,2,4,8],
-        ffn_expansion_factor = 2.66,
-        bias = False,
-        LayerNorm_type = 'WithBias',
-        dual_pixel_task = True        
-    )
+    from utils import convert_state_dict
+    from models import restormer_arch
 
-    if DEVICE.type == 'cpu':
-        state = convert_state_dict(torch.load(args.model_path, map_location='cpu')['model_state'])
-    else:
-        state = convert_state_dict(torch.load(args.model_path, map_location='cuda:0')['model_state'])    
+    model = restormer_arch.Restormer(
+        inp_channels=6, out_channels=3, dim=48,
+        num_blocks=[2, 3, 3, 4], num_refinement_blocks=4,
+        heads=[1, 2, 4, 8], ffn_expansion_factor=2.66,
+        bias=False, LayerNorm_type='WithBias', dual_pixel_task=True)
+    # Load on CPU to avoid temporarily keeping TWO copies of weights on CUDA.
+    checkpoint = torch.load(args.model_path, map_location='cpu')
+    state = convert_state_dict(checkpoint['model_state'])
     model.load_state_dict(state)
-
-    model.eval()
-    model = model.to(DEVICE)
-    return model
-
-def inference_one_im(model,im_path,args):
-    task = args.task
-    memory_fix = args.memory_fix
-
-    if task=='dewarping':
-        prompt1,prompt2,prompt3,output = dewarping(model,im_path,memory_fix)
-    elif task=='deshadowing':
-        prompt1,prompt2,prompt3,output = deshadowing(model,im_path,memory_fix)
-    elif task=='appearance':
-        prompt1,prompt2,prompt3,output = appearance(model,im_path,memory_fix)
-    elif task=='deblurring':
-        prompt1,prompt2,prompt3,output = deblurring(model,im_path,memory_fix)
-    elif task=='binarization':
-        prompt1,prompt2,prompt3,output = binarization(model,im_path,memory_fix)
-    elif task=='end2end':
-        prompt1,prompt2,prompt3,output = dewarping(model,im_path,memory_fix)
-        cv2.imwrite('output/step1.jpg',output)
-        prompt1,prompt2,prompt3,output = deshadowing(model,'output/step1.jpg',memory_fix)
-        cv2.imwrite('output/step2.jpg',output)
-        prompt1,prompt2,prompt3,output = appearance(model,'output/step2.jpg',memory_fix)
-        # os.remove('output/step1.jpg')
-        # os.remove('output/step2.jpg')
-
-    return prompt1,prompt2,prompt3,output
+    del state, checkpoint
+    model.requires_grad_(False)
+    return model.float().eval().to(DEVICE)
 
 
-def save_results(
-    img_path: str,
-    out_folder: str,
-    task: str,
-    save_dtsprompt: bool,
-):
-    os.makedirs(out_folder, exist_ok=True)
-    im_name = os.path.split(img_path)[-1]
-    im_format = '.'+im_name.split('.')[-1]
-    save_path = os.path.join(out_folder, im_name.replace(im_format, '_' + task + im_format))
-    cv2.imwrite(save_path, output)
+def inference_one_im(model, im_path, args):
+    options = dict(memory_fix=args.memory_fix,
+                   tile_size=getattr(args, 'tile_size', None),
+                   tile_overlap=getattr(args, 'tile_overlap', 64),
+                   precision=getattr(args, 'precision', 'auto'))
+    if args.task == 'end2end':
+        result = dewarping(model, im_path, **options)
+        result = deshadowing(model, result[3], **options)
+        return appearance(model, result[3], **options)
+    functions = dict(dewarping=dewarping, deshadowing=deshadowing,
+                     appearance=appearance, deblurring=deblurring,
+                     binarization=binarization)
+    return functions[args.task](model, im_path, **options)
+
+
+def _write_image(path, image, binary_bits=None, jpeg_quality=95):
+    array = np.asarray(image)
+    if binary_bits is not None:
+        if array.ndim != 2 or not np.all((array == 0) | (array == 255)):
+            raise ValueError('Binarization output must contain only 0 and 255.')
+    if array.ndim == 3:
+        array = cv2.cvtColor(array, cv2.COLOR_BGR2RGB)
+    pil_image = Image.fromarray(array.astype(np.uint8))
+    if binary_bits == 1:
+        # Explicitly disable dithering. The model's binary pixels are packed
+        # into one bit each without adding dots, gray pixels or new thresholds.
+        pil_image = pil_image.convert('1', dither=0)
+    suffix = Path(path).suffix.lower()
+    if suffix == '.png':
+        pil_image.save(str(path), format='PNG', optimize=True, compress_level=9)
+    elif suffix in ('.tif', '.tiff'):
+        compression = 'group4' if binary_bits == 1 else 'tiff_adobe_deflate'
+        pil_image.save(str(path), format='TIFF', compression=compression)
+    elif suffix in ('.jpg', '.jpeg'):
+        if binary_bits is not None:
+            raise ValueError('Use PNG or TIFF for binary images.')
+        pil_image.save(str(path), format='JPEG', quality=jpeg_quality,
+                       optimize=True, subsampling=0)
+    else:
+        raise ValueError('Unsupported output extension: {}'.format(suffix))
+
+
+def _save_path(img_path, out_folder, task, output_format, output_stem=None):
+    source = Path(img_path)
+    suffix = {'png': '.png', 'tiff': '.tiff', 'jpg': '.jpg'}[output_format]
+    label = 'binarized' if task == 'binarization' else task
+    return Path(out_folder) / '{}_{}{}'.format(output_stem or source.stem, label, suffix)
+
+
+def save_results(img_path, out_folder, task, save_dtsprompt, results,
+                 output_format='png', binary_bits=1, jpeg_quality=95, output_stem=None):
+    folder = Path(out_folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    save_path = _save_path(img_path, out_folder, task, output_format, output_stem)
+    prompt1, prompt2, prompt3, output = results
+    bits = binary_bits if task == 'binarization' else None
+    _write_image(save_path, output, binary_bits=bits, jpeg_quality=jpeg_quality)
     if save_dtsprompt:
-        cv2.imwrite(save_path.replace(im_format, '_prompt1' + im_format), prompt1)
-        cv2.imwrite(save_path.replace(im_format, '_prompt2' + im_format), prompt2)
-        cv2.imwrite(save_path.replace(im_format, '_prompt3' + im_format), prompt3)
+        for index, prompt in enumerate((prompt1, prompt2, prompt3), 1):
+            # Prompts include gray values, so they are always ordinary PNGs.
+            prompt_path = save_path.with_name('{}_prompt{}.png'.format(
+                save_path.stem, index))
+            _write_image(prompt_path, prompt)
+    return save_path
+
+
+def _output_stems(paths):
+    # Different source formats can share a stem. Preserve every image when
+    # e.g. page.jpg and page.png both become PNG; also handle name/tag clashes.
+    counts = {}
+    for path in paths:
+        key = path.stem.casefold()
+        counts[key] = counts.get(key, 0) + 1
+    used = set()
+    stems = []
+    for path in paths:
+        base = path.stem
+        if counts[base.casefold()] > 1:
+            base += '_' + path.suffix.lstrip('.').lower()
+        candidate = base
+        index = 2
+        while candidate.casefold() in used:
+            candidate = '{}_{}'.format(base, index)
+            index += 1
+        used.add(candidate.casefold())
+        stems.append(candidate)
+    return stems
+
+
+def _format_size(size):
+    value = float(size)
+    for unit in ('B', 'KiB', 'MiB', 'GiB'):
+        if value < 1024 or unit == 'GiB':
+            return '{:.1f} {}'.format(value, unit)
+        value /= 1024
+
+
+def main(argv=None):
+    global DEVICE
+    args = get_args(argv)
+    if args.device == 'auto':
+        DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        DEVICE = torch.device(args.device)
+    source = Path(args.im_path)
+    if source.is_dir():
+        paths = sorted(path for path in source.iterdir()
+                       if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
+    elif source.is_file():
+        paths = [source]
+    else:
+        raise FileNotFoundError('Input path does not exist: {}'.format(source))
+    if not paths:
+        raise ValueError('No supported images found: {}'.format(source))
+    model = model_init(args)
+    print('Device: {}; precision: {}; tile size: {}'.format(
+        DEVICE, args.precision,
+        _tile_settings(args.memory_fix, args.tile_size, args.tile_overlap)), flush=True)
+    failures = 0
+    total_bytes = 0
+    started = time.perf_counter()
+    for index, (path, output_stem) in enumerate(zip(paths, _output_stems(paths)), 1):
+        print('[{}/{}] Processing: {}'.format(index, len(paths), path.name), flush=True)
+        image_started = time.perf_counter()
+        try:
+            results = inference_one_im(model, str(path), args)
+            saved_path = save_results(path, args.out_folder, args.task, args.save_dtsprompt,
+                                      results, output_format=args.output_format,
+                                      binary_bits=args.binary_bits,
+                                      jpeg_quality=args.jpeg_quality, output_stem=output_stem)
+            saved_bytes = saved_path.stat().st_size
+            total_bytes += saved_bytes
+            print('      Saved: {} | {} | {:.1f}s'.format(
+                saved_path.name, _format_size(saved_bytes),
+                time.perf_counter() - image_started), flush=True)
+            del results
+        except Exception as error:
+            failures += 1
+            print('Failed: {}: {}'.format(path.name, error), file=sys.stderr, flush=True)
+        # Free cached allocations between pages, not between every successful tile.
+        gc.collect()
+        if DEVICE.type == 'cuda':
+            torch.cuda.empty_cache()
+    print('\nCompleted: {}/{} images; {} failed; {}; {:.1f}s.'.format(
+        len(paths) - failures, len(paths), failures, _format_size(total_bytes),
+        time.perf_counter() - started), flush=True)
+    return 1 if failures else 0
 
 
 if __name__ == '__main__':
+    sys.exit(main())
 
-    ## model init
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    args = get_args()
-    model = model_init(args)
-
-    img_source = args.im_path
-
-    if Path(img_source).is_dir():
-        img_paths = glob.glob(os.path.join(img_source, '*'))
-        for img_path in img_paths:
-            ## inference
-            prompt1,prompt2,prompt3,output = inference_one_im(model,img_path,args)
-
-            ## results saving
-            save_results(
-                img_path=img_path,
-                out_folder=args.out_folder,
-                task=args.task,
-                save_dtsprompt=args.save_dtsprompt,
-            )
-            
-    else:
-        ## inference
-        prompt1,prompt2,prompt3,output = inference_one_im(model,img_source,args)
-
-        ## results saving
-        save_results(
-            img_path=img_source,
-            out_folder=args.out_folder,
-            task=args.task,
-            save_dtsprompt=args.save_dtsprompt,
-        )
