@@ -10,6 +10,7 @@
 </p>
 
 # NEW
+* 2026-10-12 Created a GUI
 * 2026-10-11 Fixed OOM issues so no need to resize before.
 * 2026-10-03 Fixed an issue with `requirements.txt` that was installing unsupported newer versions of some dependencies. Also added `run.bat`, which automatically processes all files in the `input` folder.
 * 2026-01-23 Updated the script to fix the Cuda out of Memory.
@@ -17,7 +18,7 @@
 * 2026-03-29 Add another model support for binarization
 
 # TO DO
-* Create GUI
+Fix the GUI so it uses GPU instead of CPU.
 
 ## SETUP
 ```bash
@@ -43,7 +44,13 @@ python inference.py --im_path ./input/for_binarization.png --task binarization -
 - `--im_path`: the path of input document image
 - `--task`: task that need to be executed, it must be one of _binarization_, _dewarping_, _deshadowing_, _appearance_, _deblurring_, or _end2end_
 - `--save_dtsprompt`: whether to save the DTSPrompt
-  
+
+## GUI
+
+1. Open `launch_gui.bat`
+
+<img width="1920" height="1032" alt="bild" src="https://github.com/user-attachments/assets/3c3f9aa7-8de4-43d1-835f-dee13636b1b3" />
+
 ## CITATION
 ```
 @inproceedings{zhangdocres2024, 
