@@ -7,3 +7,5 @@ opencv-python-headless==4.5.5.64
 scikit-image==0.19.3
 einops
 tqdm
+PySide6>=6.5,<7
+Pillow>=9.1,<13

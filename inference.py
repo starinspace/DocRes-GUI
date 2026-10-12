@@ -1,3 +1,10 @@
+"""DocRes inference with CPU blending and automatic CUDA OOM tile retries.
+
+Replace the fork's inference.py with this file. Existing task names and
+checkpoint format are retained. Binarization/deblurring keep native resolution;
+appearance/deshadowing keep their global lighting-map reconstruction.
+"""
+
 import cv2
 import gc
 import sys
