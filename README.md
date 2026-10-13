@@ -10,6 +10,7 @@
 </p>
 
 # NEW
+* 2026-10-13 Fixed the GUI so it uses GPU instead of CPU.
 * 2026-10-12 Created a GUI
 * 2026-10-11 Fixed OOM issues so no need to resize before.
 * 2026-10-03 Fixed an issue with `requirements.txt` that was installing unsupported newer versions of some dependencies. Also added `run.bat`, which automatically processes all files in the `input` folder.
@@ -18,7 +19,7 @@
 * 2026-03-29 Add another model support for binarization
 
 # TO DO
-Fix the GUI so it uses GPU instead of CPU.
+?
 
 ## SETUP
 ```bash
