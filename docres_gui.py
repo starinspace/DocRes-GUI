@@ -41,7 +41,7 @@ STAGES = [
 ]
 DEFAULTS = dict(theme='dark', tasks=['binarization'], automatic=False,
                 comparison='split', wipe=50, preview_edge=1600, debounce=900,
-                tile_size=512, overlap=64, precision='auto', device='auto',
+                tile_size=512, overlap=64, precision='auto', device='cuda',
                 output_format='png', binary_bits=1, jpeg_quality=95,
                 conflict='keep_both', preserve_dpi=True, recursive=False,
                 remember_files=True, remember_settings=True,
@@ -202,11 +202,91 @@ def emit_event(event, **values):
     print(PROTOCOL + json.dumps(dict(event=event, **values), ensure_ascii=True), flush=True)
 
 
+def runtime_report(torch_module=None):
+    """Probe the same interpreter used for inference, without importing Qt."""
+    report = dict(python=sys.executable, python_version=sys.version.split()[0],
+                  environment=os.environ.get('CONDA_DEFAULT_ENV') or os.environ.get('VIRTUAL_ENV') or 'not activated',
+                  torch_version='', torch_path='', cuda_build='', cuda_available=False,
+                  cuda_usable=False, gpu_name='', gpu_memory=0,
+                  cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES', 'not set'), reason='')
+    try:
+        if torch_module is None:
+            import torch as torch_module
+        report['torch_version'] = str(torch_module.__version__)
+        report['torch_path'] = str(getattr(torch_module, '__file__', ''))
+        report['cuda_build'] = getattr(torch_module.version, 'cuda', None) or ''
+        report['cuda_available'] = bool(torch_module.cuda.is_available())
+        if not report['cuda_available']:
+            report['reason'] = ('This Python has CPU-only PyTorch. Start launch_gui.bat to use the docresfork environment. '
+                'If that environment also has CPU-only PyTorch, install a compatible CUDA-enabled build there.'
+                if not report['cuda_build'] else
+                'PyTorch includes CUDA, but no usable NVIDIA GPU is visible. Check the NVIDIA driver, '
+                'CUDA_VISIBLE_DEVICES and the Python environment.')
+            return report
+        report['gpu_name'] = torch_module.cuda.get_device_name(0)
+        report['gpu_memory'] = int(torch_module.cuda.get_device_properties(0).total_memory)
+        probe = None
+        try:
+            # Availability alone does not detect missing GPU kernels or driver failures.
+            probe = torch_module.ones(1, device='cuda:0')
+            probe.add_(1)
+            torch_module.cuda.synchronize()
+            if probe.item() != 2:
+                raise RuntimeError('The CUDA calculation returned an invalid result.')
+            report['cuda_usable'] = True
+        finally:
+            del probe
+            with contextlib.suppress(Exception):
+                torch_module.cuda.empty_cache()
+    except Exception as error:
+        report['reason'] = 'CUDA/runtime check failed: ' + str(error)
+    return report
+
+
+def runtime_text(report):
+    return '\n'.join((
+        'Python: ' + report['python'],
+        'Python version: ' + report['python_version'],
+        'Environment: ' + report['environment'],
+        'PyTorch: ' + (report['torch_version'] or 'not available'),
+        'PyTorch path: ' + report['torch_path'],
+        'CUDA build: ' + (report['cuda_build'] or 'none'),
+        'CUDA available: ' + str(report['cuda_available']),
+        'CUDA calculation passed: ' + str(report['cuda_usable']),
+        'GPU: ' + (report['gpu_name'] or 'not detected'),
+        'GPU memory: {:.1f} GiB'.format(report['gpu_memory'] / 1024 ** 3),
+        'CUDA_VISIBLE_DEVICES: ' + report['cuda_visible_devices'],
+        'Result: ' + ('GPU ready.' if report['cuda_usable'] else report['reason'])))
+
+
+def select_device(requested, report):
+    if requested == 'cpu':
+        return 'cpu'
+    if report['cuda_usable']:
+        return 'cuda'
+    if requested == 'auto':
+        return 'cpu'
+    raise RuntimeError('CUDA / GPU is required; processing was not started on CPU. ' + report['reason'] +
+                       '\nPython: ' + report['python'] + '\nOpen Engine → Check GPU / Python for diagnostics.')
+
+
+def runtime_main():
+    report = runtime_report()
+    print(runtime_text(report), flush=True)
+    return 1 if '--require-cuda' in sys.argv and not report['cuda_usable'] else 0
+
+
 class EngineSession:
     def __init__(self):
         self.module = None
         self.key = None
         self.model = None
+        self.runtime = None
+
+    def check_runtime(self):
+        self.runtime = runtime_report()
+        emit_event('runtime', report=self.runtime)
+        return self.runtime
 
     def prepare(self, cfg):
         engine = Path(cfg['engine_path']).resolve()
@@ -215,19 +295,19 @@ class EngineSession:
             raise FileNotFoundError('inference.py was not found. Select it in the Engine tab.')
         if not checkpoint.is_file():
             raise FileNotFoundError('Model checkpoint was not found. Select models/docres.pkl in the Engine tab.')
-        key = (str(engine), engine.stat().st_mtime_ns, str(checkpoint), checkpoint.stat().st_mtime_ns, cfg['device'])
+        report = self.runtime if self.runtime is not None else self.check_runtime()
+        device = select_device(cfg['device'], report)
+        key = (str(engine), engine.stat().st_mtime_ns, str(checkpoint), checkpoint.stat().st_mtime_ns, device)
         if self.key == key and self.model is not None:
             return self.module, self.model
         emit_event('loading', message='Loading the restoration model…')
         import torch
-        if cfg['device'] == 'cuda' and not torch.cuda.is_available():
-            raise RuntimeError('CUDA is not available. Choose Auto or CPU in the Engine tab.')
-        if cfg['device'] == 'cpu' and 'dewarping' in cfg['tasks']:
+        if device == 'cpu' and 'dewarping' in cfg['tasks']:
             raise RuntimeError('The MBD dewarping helper in this fork requires CUDA. Use Auto/CUDA or uncheck Dewarp.')
         self.model = None
         import gc
         gc.collect()
-        if torch.cuda.is_available():
+        if device == 'cuda':
             torch.cuda.empty_cache()
         os.chdir(str(engine.parent))
         if str(engine.parent) not in sys.path:
@@ -237,15 +317,21 @@ class EngineSession:
         spec.loader.exec_module(module)
         if not hasattr(module, '_predict_tiled'):
             raise RuntimeError('This GUI needs the updated tiled inference.py included in the package.')
-        device = cfg['device']
-        if device == 'auto':
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
         if device == 'cpu' and 'dewarping' in cfg['tasks']:
             raise RuntimeError('Dewarping requires CUDA in the fork\'s MBD helper. Uncheck Dewarp to use CPU.')
         module.DEVICE = torch.device(device)
         self.model = module.model_init(SimpleNamespace(model_path=str(checkpoint)))
+        if callable(getattr(self.model, 'parameters', None)):
+            parameter = next(self.model.parameters(), None)
+            if parameter is not None and parameter.device.type != device:
+                self.model = None
+                raise RuntimeError('The inference engine loaded the model on the wrong device. '
+                                   'Select the updated inference.py included in this package.')
         self.module, self.key = module, key
-        emit_event('engine', device=device, message='Model ready on {}.'.format(device.upper()))
+        if device == 'cpu' and cfg['device'] == 'auto':
+            emit_event('warning', message='Auto selected CPU: ' + report['reason'])
+        description = '{} · {}'.format(report['gpu_name'], device.upper()) if device == 'cuda' else 'CPU'
+        emit_event('engine', device=device, message='Model ready on {}.'.format(description))
         return module, self.model
 
     def run(self, request):
@@ -323,6 +409,9 @@ def worker_main():
             request = json.loads(line)
             if request.get('op') == 'shutdown':
                 return 0
+            if request.get('op') == 'diagnose':
+                session.check_runtime()
+                continue
             session.run(request)
         except Exception as error:
             emit_event('fatal', id=request.get('id') if isinstance(request, dict) else None, message=str(error))
@@ -332,8 +421,11 @@ def worker_main():
 
 # Worker startup bypasses every Qt import. This also isolates OpenCV's Qt
 # plugin environment changes and all GPU allocations from the desktop UI.
-if __name__ == '__main__' and '--worker' in sys.argv:
-    raise SystemExit(worker_main())
+if __name__ == '__main__':
+    if '--check-runtime' in sys.argv:
+        raise SystemExit(runtime_main())
+    if '--worker' in sys.argv:
+        raise SystemExit(worker_main())
 
 from PySide6.QtCore import (Qt, QTimer, QProcess, QProcessEnvironment, QStandardPaths,
                            Signal, QObject, QRunnable, QThreadPool, QRectF, QPointF, QSize)
@@ -706,7 +798,7 @@ def combo(items, tip):
 
 
 class StudioWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, device_override=None):
         super().__init__()
         self.setWindowTitle('DocRes Studio')
         self.resize(1460, 920)
@@ -722,10 +814,14 @@ class StudioWindow(QMainWindow):
                 self.cfg = validated_settings(self.saved_raw)
             except (OSError, ValueError):
                 logging.exception('Could not read saved settings')
+        if device_override is not None:
+            self.cfg['device'] = device_override
         self.initializing = True
         self.temp = tempfile.TemporaryDirectory(prefix='docres-studio-')
         self.worker = None
         self.worker_engine = None
+        self.runtime_info = None
+        self.diagnose_pending = False
         self.stdout_buffer = ''
         self.active = None
         self.pending_auto = False
@@ -757,6 +853,7 @@ class StudioWindow(QMainWindow):
             if isinstance(files, list):
                 self.add_images([path for path in files if isinstance(path, str) and Path(path).is_file()])
         self._update_buttons()
+        QTimer.singleShot(0, self.check_gpu)
 
     def _build_ui(self):
         root = QWidget()
@@ -1040,6 +1137,17 @@ class StudioWindow(QMainWindow):
     def _engine_tab(self):
         scroll, layout = self._scroll_page()
         layout.addWidget(label('PREVIEW & PROCESSING', 'eyebrow'))
+        self.gpu_status = label('Checking GPU / Python…', 'muted', True)
+        layout.addWidget(self.gpu_status)
+        diagnostic_row = QHBoxLayout()
+        self.gpu_check_button = button('Check GPU / Python', self.check_gpu,
+            tooltip='Test CUDA in the exact Python used by the model worker. Does not load the document model.')
+        self.gpu_copy_button = button('Copy report', self.copy_gpu_report,
+            tooltip='Copy the Python path, PyTorch version, CUDA build, GPU and diagnostic result.')
+        self.gpu_copy_button.setEnabled(False)
+        diagnostic_row.addWidget(self.gpu_check_button)
+        diagnostic_row.addWidget(self.gpu_copy_button)
+        layout.addLayout(diagnostic_row)
         self.preview_quality = combo([('Fast · 1024 px', 1024), ('Balanced · 1600 px', 1600),
                                       ('Detailed · 2048 px', 2048), ('Full resolution', 0)],
                                      'Longest edge used only for previews. Batch and Save always process the full-resolution original.')
@@ -1057,8 +1165,9 @@ class StudioWindow(QMainWindow):
         self.overlap_combo.currentIndexChanged.connect(self._processing_changed)
         layout.addWidget(label('Tile overlap', 'muted'))
         layout.addWidget(self.overlap_combo)
-        self.device_combo = combo([('Auto · CUDA when available', 'auto'), ('CUDA / GPU', 'cuda'), ('CPU', 'cpu')],
-                                  'CPU works for non-dewarping steps. The MBD dewarping helper in this fork requires CUDA.')
+        self.device_combo = combo([('CUDA / GPU · required', 'cuda'), ('Auto · allow CPU fallback', 'auto'), ('CPU · explicit', 'cpu')],
+                                  'CUDA is the default and refuses CPU fallback. Auto may use CPU when CUDA fails. '
+                                  'CPU must be selected explicitly. Dewarping requires CUDA.')
         self.device_combo.currentIndexChanged.connect(self._processing_changed)
         layout.addWidget(label('Processing device', 'muted'))
         layout.addWidget(self.device_combo)
@@ -1132,6 +1241,7 @@ class StudioWindow(QMainWindow):
         action(settings, 'Reset settings to defaults', self.reset_settings)
         help_menu = self.menuBar().addMenu('Help')
         action(help_menu, 'Quick guide', self.show_help)
+        action(help_menu, 'Check GPU / Python', self.check_gpu)
 
     def _set_combo(self, widget, value):
         index = widget.findData(value)
@@ -1209,6 +1319,7 @@ class StudioWindow(QMainWindow):
         self._update_export_controls()
         self._mark_preview()
         self._update_buttons()
+        self._update_runtime_status()
         self._schedule_settings()
         if self.automatic.isChecked():
             self.preview_timer.start(self.debounce.value())
@@ -1479,6 +1590,7 @@ class StudioWindow(QMainWindow):
         self.selected_button.setEnabled(bool(self.selected_paths()) and has_tasks and not busy)
         self.batch_button.setEnabled(self.queue.count() > 0 and has_tasks and not busy)
         self.stop_button.setEnabled(busy)
+        self.gpu_check_button.setEnabled(not busy)
         batch_busy = busy and self.active['mode'] != 'preview'
         self.tabs.setEnabled(not batch_busy)
         self.remove_button.setEnabled(not batch_busy and bool(self.selected_paths()))
@@ -1556,6 +1668,10 @@ class StudioWindow(QMainWindow):
         if cfg['device'] == 'cpu' and 'dewarping' in cfg['tasks']:
             self._report_error('The MBD dewarping helper requires CUDA. Choose Auto/CUDA or uncheck Dewarp.')
             return
+        if cfg['device'] == 'cuda' and self.runtime_info is not None and not self.runtime_info['cuda_usable']:
+            self._report_error('GPU processing is unavailable: ' + self.runtime_info['reason'])
+            self.tabs.setCurrentIndex(2)
+            return
         self.preview_timer.stop()
         self.pending_auto = False
         self.cancelled = False
@@ -1585,6 +1701,8 @@ class StudioWindow(QMainWindow):
             old.deleteLater()
         self.stdout_buffer = ''
         self.worker_engine = engine
+        self.runtime_info = None
+        self.diagnose_pending = True
         process = QProcess(self)
         self.worker = process
         process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
@@ -1598,12 +1716,60 @@ class StudioWindow(QMainWindow):
             executable = executable.with_name('python.exe')
         process.setProgram(str(executable))
         process.setArguments([str(Path(__file__).resolve()), '--worker'])
-        process.started.connect(self._send_active)
+        process.started.connect(self._worker_started)
         process.readyReadStandardOutput.connect(self._read_stdout)
         process.readyReadStandardError.connect(self._read_stderr)
         process.finished.connect(self._worker_exited)
         process.errorOccurred.connect(self._worker_error)
         process.start()
+
+    def _worker_started(self):
+        self._send_diagnosis()
+        self._send_active()
+
+    def _send_diagnosis(self):
+        if self.diagnose_pending and self.worker and self.worker.state() == QProcess.ProcessState.Running:
+            self.worker.write(b'{"op":"diagnose"}\n')
+            self.diagnose_pending = False
+
+    def check_gpu(self):
+        if self.closing:
+            return
+        if self.active:
+            self.status.setText('Finish or stop the current job before checking the runtime.')
+            return
+        self.diagnose_pending = True
+        self.gpu_status.setText('Checking GPU / Python…')
+        self.engine_badge.setText('CHECKING GPU')
+        self._ensure_worker(self.engine_path.text())
+        self._send_diagnosis()
+
+    def copy_gpu_report(self):
+        if self.runtime_info is None:
+            self.check_gpu()
+            return
+        text = runtime_text(self.runtime_info) + '\nSelected processing device: ' + self.device_combo.currentData()
+        QApplication.instance().clipboard().setText(text)
+        self.status.setText('GPU / Python diagnostic report copied.')
+
+    def _update_runtime_status(self):
+        if self.runtime_info is None:
+            return
+        report = self.runtime_info
+        selected = self.device_combo.currentData()
+        if report['cuda_usable']:
+            summary = '{} · {:.1f} GiB\nPyTorch {} · CUDA {}'.format(
+                report['gpu_name'], report['gpu_memory'] / 1024 ** 3, report['torch_version'], report['cuda_build'])
+            badge = 'CPU SELECTED' if selected == 'cpu' else 'GPU AVAILABLE'
+        else:
+            summary = 'CUDA unavailable\n' + report['reason']
+            badge = 'CPU SELECTED' if selected == 'cpu' else 'AUTO → CPU' if selected == 'auto' else 'CUDA UNAVAILABLE'
+        self.gpu_status.setText(summary)
+        self.gpu_status.setToolTip(runtime_text(report))
+        self.gpu_copy_button.setEnabled(True)
+        if not self.active:
+            self.engine_badge.setText(badge)
+        self.engine_badge.setToolTip(runtime_text(report))
 
     def _send_active(self):
         if self.active and not self.active.get('_sent') and self.worker:
@@ -1632,6 +1798,18 @@ class StudioWindow(QMainWindow):
     def _handle_event(self, event):
         kind = event['event']
         if kind == 'ready':
+            return
+        if kind == 'runtime':
+            self.runtime_info = event['report']
+            self._update_runtime_status()
+            self.log.appendPlainText(runtime_text(self.runtime_info))
+            if not self.active and self.device_combo.currentData() == 'cuda' and not self.runtime_info['cuda_usable']:
+                self.status.setText('CUDA is unavailable in this Python. See Engine → Check GPU / Python.')
+            return
+        if kind == 'warning':
+            self.log.appendPlainText('WARNING: ' + event['message'])
+            self.log.show()
+            self.log_button.setText('Hide details')
             return
         if kind in ('loading', 'engine'):
             self.status.setText(event['message'])
@@ -1685,6 +1863,8 @@ class StudioWindow(QMainWindow):
         self.progress.setValue(0 if failed else 100)
         self._mark_preview()
         self._update_buttons()
+        if failed:
+            self._update_runtime_status()
         if self.pending_auto and self.automatic.isChecked() and not self.cancelled:
             self.pending_auto = False
             self.preview_timer.start(self.debounce.value())
@@ -1723,6 +1903,7 @@ class StudioWindow(QMainWindow):
                                           'Stopped' if self.cancelled else 'Failed')
             self._finish_job(failed=True)
         self.engine_badge.setText('ENGINE IDLE')
+        self._update_runtime_status()
 
     def _worker_error(self, error):
         if error == QProcess.ProcessError.FailedToStart:
@@ -1823,7 +2004,12 @@ class StudioWindow(QMainWindow):
 
 
 def gui_main():
-    app = QApplication(sys.argv)
+    import argparse
+    parser = argparse.ArgumentParser(description='DocRes Studio desktop workspace.')
+    parser.add_argument('--device', choices=('cuda', 'auto', 'cpu'), default=None,
+                        help='Override the saved device for this launch. The BAT uses cuda by default.')
+    arguments, qt_arguments = parser.parse_known_args()
+    app = QApplication([sys.argv[0]] + qt_arguments)
     app.setApplicationName('DocRes Studio')
     app.setOrganizationName('DocResStudio')
     app.setStyle('Fusion')
@@ -1836,7 +2022,7 @@ def gui_main():
         logging.error('Unhandled exception', exc_info=(kind, value, tb))
         QMessageBox.critical(None, 'DocRes Studio error', str(value) + '\n\nDetails were written to the application log.')
     sys.excepthook = exception_hook
-    window = StudioWindow()
+    window = StudioWindow(device_override=arguments.device)
     available = app.primaryScreen().availableGeometry()
     window.resize(min(window.width(), available.width() - 30),
                   min(window.height(), available.height() - 50))
