@@ -25,7 +25,7 @@
 ```bash
 conda create -n docresfork python=3.10.19
 conda activate docresfork
-git clone https://github.com/starinspace/DocRes-Fork
+git clone https://github.com/starinspace/DocRes-GUI
 cd DocRes-Fork
 pip install -r requirements.txt
 ```
